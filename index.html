@@ -44,6 +44,27 @@
     letter-spacing: 2px;
     pointer-events: none;
   }
+  #tally {
+    position: fixed;
+    top: 32px;
+    left: 14px;
+    font-size: 12px;
+    letter-spacing: 1px;
+    pointer-events: none;
+  }
+  #msg {
+    position: fixed;
+    top: 56px;
+    left: 0;
+    right: 0;
+    text-align: center;
+    font-size: 28px;
+    font-weight: bold;
+    letter-spacing: 4px;
+    color: var(--ink);
+    opacity: 0;
+    pointer-events: none;
+  }
   #gauge {
     position: fixed;
     top: 14px;
@@ -70,16 +91,16 @@
   }
   #padLeft {
     left: 0;
-    width: 46%;
+    width: 40%;
     grid-template-columns: 1fr 1fr;
   }
   #padRight {
     right: 0;
-    width: 50%;
+    width: 58%;
     grid-template-columns: 1fr 1fr 1fr;
   }
   .btn {
-    height: 64px;
+    height: 56px;
     border: 3px solid var(--ink);
     border-radius: 12px;
     background: var(--btn);
@@ -103,17 +124,22 @@
 <body>
 <canvas id="game"></canvas>
 <div id="title">INKRUNNER v1</div>
+<div id="tally">TRICKS 0</div>
+<div id="msg"></div>
 <div id="gauge"><div id="gaugeFill"></div></div>
 
 <div id="padLeft" class="pad">
-  <button class="btn" data-act="left">STEER LEFT</button>
-  <button class="btn" data-act="right">STEER RIGHT</button>
+  <button class="btn" data-act="left">LEFT</button>
+  <button class="btn" data-act="right">RIGHT</button>
 </div>
 
 <div id="padRight" class="pad">
-  <button class="btn" data-act="hopL">HOP LEFT</button>
+  <button class="btn" data-act="hopL">HOP L</button>
   <button class="btn" data-act="hopUp">HOP</button>
-  <button class="btn" data-act="hopR">HOP RIGHT</button>
+  <button class="btn" data-act="hopR">HOP R</button>
+  <button class="btn" data-act="kick">KICK</button>
+  <button class="btn" data-act="flip180">180</button>
+  <button class="btn" data-act="spin360">360</button>
   <button class="btn" data-act="boost">BOOST</button>
   <button class="btn" data-act="gas">GAS</button>
 </div>
@@ -125,6 +151,8 @@
   const canvas = document.getElementById("game");
   const ctx = canvas.getContext("2d");
   const gaugeFill = document.getElementById("gaugeFill");
+  const msgEl = document.getElementById("msg");
+  const tallyEl = document.getElementById("tally");
 
   // Palette: light paper, graphite pencil, deep blue ink, icy cold gas.
   const PAPER = "#f1efe9";
@@ -140,7 +168,7 @@
   const R_INNER = 120;
   const R_OUTER = 240;
   const GRAVITY = 700;
-  const HOP_IMPULSE = 300;
+  const HOP_IMPULSE = 330;
   const SIDE_IMPULSE = 230;
   const SIDE_LIFT = 200;
   const HOP_COST = 22;
@@ -149,6 +177,14 @@
   const REFILL = 14;
   const MAX_SPEED = 420;
   const POOL_SIZE = 240;
+
+  // Air tricks. Each spins the car with cold gas thrusters while airborne.
+  // Kickflip rolls the car about its length. 180 and 360 yaw it around.
+  const TRICKS = {
+    kick: { name: "KICKFLIP", axis: "roll", angle: Math.PI * 2, dur: 0.45, cost: 16 },
+    flip180: { name: "180", axis: "yaw", angle: Math.PI, dur: 0.4, cost: 18 },
+    spin360: { name: "360", axis: "yaw", angle: Math.PI * 2, dur: 0.8, cost: 26 }
+  };
 
   let W = 0;
   let H = 0;
@@ -159,12 +195,18 @@
     x: 0, y: 0, h: 0,
     vx: 0, vy: 0,
     z: 0, vz: 0,
+    roll: 0,
+    trick: null,
+    tricks: 0,
     pressure: 100,
     burst: false
   };
 
+  let msgText = "";
+  let msgTimer = 0;
+
   const held = { left: false, right: false, gas: false, boost: false };
-  const taps = { hopUp: false, hopL: false, hopR: false };
+  const taps = { hopUp: false, hopL: false, hopR: false, kick: false, flip180: false, spin360: false };
 
   // Deterministic jitter so the sketch lines are the same every run.
   let seed = 1337;
@@ -366,7 +408,19 @@
   function drawCar(sx, sy, k) {
     const cs = Math.cos(car.h);
     const sn = Math.sin(car.h);
-    ctx.setTransform(DPR * k * cs, DPR * k * sn, -DPR * k * sn, DPR * k * cs, DPR * sx, DPR * sy);
+
+    // Kickflip roll squeezes the car's width. Below zero the far side shows.
+    let cr = Math.cos(car.roll);
+    if (Math.abs(cr) < 0.08) cr = cr < 0 ? -0.08 : 0.08;
+
+    ctx.setTransform(
+      DPR * k * cs,
+      DPR * k * sn,
+      -DPR * k * sn * cr,
+      DPR * k * cs * cr,
+      DPR * sx,
+      DPR * sy
+    );
 
     ctx.fillStyle = INK;
     for (let i = 0; i < WHEELS.length; i++) {
@@ -455,12 +509,66 @@
     }
   }
 
+  function startTrick(key, airborne) {
+    const T = TRICKS[key];
+    if (!airborne || car.trick || car.pressure < T.cost) return;
+    car.trick = {
+      name: T.name,
+      axis: T.axis,
+      angle: T.angle,
+      dur: T.dur,
+      remaining: T.angle,
+      dir: held.left ? -1 : 1
+    };
+    car.pressure -= T.cost;
+    car.burst = true;
+  }
+
+  function showMsg(text) {
+    msgText = text;
+    msgTimer = 1.1;
+  }
+
+  function updateTrick(dt) {
+    const tr = car.trick;
+    const step = Math.min(tr.remaining, (tr.angle / tr.dur) * dt);
+    tr.remaining -= step;
+    if (tr.axis === "roll") car.roll += step * tr.dir;
+    else car.h += step * tr.dir;
+
+    // Spin thrusters fire from both sides while the trick runs.
+    const lx = -Math.sin(car.h);
+    const ly = Math.cos(car.h);
+    for (let i = 0; i < 2; i++) {
+      const side = i === 0 ? 1 : -1;
+      emit(
+        car.x + lx * side * 12,
+        car.y + ly * side * 12,
+        car.z + 2,
+        lx * side * 120 + (Math.random() - 0.5) * 30,
+        ly * side * 120 + (Math.random() - 0.5) * 30,
+        10,
+        0.4,
+        8
+      );
+    }
+
+    if (tr.remaining <= 1e-6) {
+      car.trick = null;
+      car.roll = 0;
+      car.tricks += 1;
+      tallyEl.textContent = "TRICKS " + car.tricks;
+      showMsg(tr.name);
+    }
+  }
+
   function update(dt) {
     const grounded = car.z <= 0 && car.vz <= 0;
+    const airborne = car.z > 0 || car.vz !== 0;
     car.burst = false;
 
-    // Steering. Turning is slower in the air.
-    const steer = (held.right ? 1 : 0) - (held.left ? 1 : 0);
+    // Steering. Turning is slower in the air and stops during a trick.
+    const steer = car.trick ? 0 : (held.right ? 1 : 0) - (held.left ? 1 : 0);
     const speed = Math.hypot(car.vx, car.vy);
     const turnRate = grounded ? 2.4 : 1.1;
     car.h += steer * turnRate * dt * Math.min(1, speed / 90);
@@ -532,6 +640,20 @@
       taps.hopR = false;
       if (car.pressure >= SIDE_COST) sideBurst(1, grounded);
     }
+    if (taps.kick) {
+      taps.kick = false;
+      startTrick("kick", airborne);
+    }
+    if (taps.flip180) {
+      taps.flip180 = false;
+      startTrick("flip180", airborne);
+    }
+    if (taps.spin360) {
+      taps.spin360 = false;
+      startTrick("spin360", airborne);
+    }
+
+    if (car.trick) updateTrick(dt);
 
     // Gravity and landing.
     if (car.z > 0 || car.vz !== 0) {
@@ -540,6 +662,11 @@
       if (car.z <= 0) {
         car.z = 0;
         car.vz = 0;
+        car.roll = 0;
+        if (car.trick) {
+          car.trick = null;
+          showMsg("BAIL");
+        }
       }
     }
 
@@ -550,17 +677,21 @@
       car.pressure = Math.min(100, car.pressure + REFILL * dt);
     }
 
+    if (msgTimer > 0) msgTimer = Math.max(0, msgTimer - dt);
+
     updatePlumes(dt);
   }
 
   let lastPct = -1;
-  function updateGauge() {
+  function updateHud() {
     const pct = Math.round(car.pressure);
     if (pct !== lastPct) {
       lastPct = pct;
       gaugeFill.style.width = pct + "%";
       gaugeFill.style.background = pct < 20 ? "#ff9e84" : "#7cc4f0";
     }
+    msgEl.textContent = msgText;
+    msgEl.style.opacity = Math.min(1, msgTimer * 2);
   }
 
   // Input: on-screen buttons.
@@ -588,7 +719,8 @@
     ArrowRight: "right", KeyD: "right",
     ArrowUp: "gas", KeyW: "gas",
     ShiftLeft: "boost", ShiftRight: "boost",
-    KeyQ: "hopL", KeyE: "hopR", Space: "hopUp"
+    KeyQ: "hopL", KeyE: "hopR", Space: "hopUp",
+    KeyZ: "kick", KeyX: "flip180", KeyC: "spin360"
   };
   window.addEventListener("keydown", function (e) {
     const act = KEYMAP[e.code];
@@ -619,7 +751,7 @@
     last = now;
     update(dt);
     render();
-    updateGauge();
+    updateHud();
     requestAnimationFrame(frame);
   }
 
