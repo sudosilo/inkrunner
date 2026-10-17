@@ -209,14 +209,13 @@
   const MAX_SPEED = 420;
   const POOL_SIZE = 240;
 
-  // Track and wall tuning.
-  const N_TRACK = 720;
-  const TRACK_HALF = 80;
+  // Track and wall tuning. The road is wide enough for several cars side by side.
+  const N_TRACK = 1200;
+  const TRACK_HALF = 150;
   const TRACK_W = TRACK_HALF * 2;
   const WALL_T = 10;
   const BARRIER_H = 16;
   const R_CAR = 14;
-  const OFF_MAP = 260;
   const CRASH_TIME = 1.2;
   const SAFE_AGE = 0.5;
   const SAMPLE_HZ = 30;
@@ -252,7 +251,6 @@
 
   // Lap state, ghost state and safe respawn samples.
   let trackIdx = 0;
-  let nearestDist = 0;
   let lastS = 0;
   let lapNum = 1;
   let lapStart = 0;
@@ -273,10 +271,6 @@
   function seeded() {
     seed = (seed * 16807) % 2147483647;
     return seed / 2147483647;
-  }
-
-  function clamp(v, lo, hi) {
-    return v < lo ? lo : v > hi ? hi : v;
   }
 
   function wobbled(points, amount) {
@@ -427,7 +421,7 @@
     const pts = [];
     for (let i = 0; i < N_TRACK; i++) {
       const th = (i / N_TRACK) * Math.PI * 2;
-      const r = 440 * (1 + 0.22 * Math.sin(2 * th + 0.7) + 0.14 * Math.sin(3 * th + 2.1) +
+      const r = 640 * (1 + 0.22 * Math.sin(2 * th + 0.7) + 0.14 * Math.sin(3 * th + 2.1) +
                        0.08 * Math.sin(5 * th + 4.0) + 0.05 * Math.sin(7 * th + 1.3));
       pts.push({ x: Math.cos(th) * r * 1.3, y: Math.sin(th) * r, h: 0 });
     }
@@ -781,12 +775,12 @@
     }
   }
 
-  // Find the nearest centerline point near the last known index.
+  // Nearest centerline point to the car. The whole loop is checked, so the
+  // car can drive anywhere, on the road or off it.
   function updateTrackIdx() {
-    let best = trackIdx;
+    let best = 0;
     let bestD = Infinity;
-    for (let k = -25; k <= 25; k++) {
-      const i = (trackIdx + k + N_TRACK) % N_TRACK;
+    for (let i = 0; i < N_TRACK; i++) {
       const p = TRACK.pts[i];
       const dx = car.x - p.x;
       const dy = car.y - p.y;
@@ -797,7 +791,6 @@
       }
     }
     trackIdx = best;
-    nearestDist = Math.sqrt(bestD);
   }
 
   // Signed distance from the centerline, positive to the left of travel.
@@ -806,21 +799,28 @@
     return (car.x - p.x) * -Math.sin(p.h) + (car.y - p.y) * Math.cos(p.h);
   }
 
-  // Brace: while BRACE is held, a wall hit bounces the car off with cold gas
-  // instead of crashing. Each bounce costs pressure.
+  // Brace: while BRACE is held, a wall touch bounces the car back out with
+  // cold gas instead of crashing. Each bounce costs pressure.
   function braceBounce(lat) {
     const p = TRACK.pts[trackIdx];
     const nx = -Math.sin(p.h);
     const ny = Math.cos(p.h);
     const sgn = lat > 0 ? 1 : -1;
-    const limit = TRACK_HALF - R_CAR;
+    const absLat = Math.abs(lat);
+    const wallCenter = TRACK_HALF + WALL_T / 2;
+
+    // Inside the wall band the car is pushed to the road side. Outside it,
+    // the car is pushed back out to the far side of the wall.
+    const inner = absLat < wallCenter;
+    const target = sgn * (inner ? TRACK_HALF - R_CAR : TRACK_HALF + WALL_T + R_CAR);
+    const toWall = inner ? sgn : -sgn;
 
     const vn = car.vx * nx + car.vy * ny;
-    if (vn * sgn > 0) {
+    if (vn * toWall > 0) {
       car.vx -= 1.5 * vn * nx;
       car.vy -= 1.5 * vn * ny;
     }
-    const push = sgn * limit - lat;
+    const push = target - lat;
     car.x += nx * push;
     car.y += ny * push;
 
@@ -828,11 +828,11 @@
     car.burst = true;
     for (let i = 0; i < 6; i++) {
       emit(
-        car.x + nx * sgn * R_CAR,
-        car.y + ny * sgn * R_CAR,
+        car.x + nx * toWall * R_CAR,
+        car.y + ny * toWall * R_CAR,
         car.z + 2,
-        -nx * sgn * 140 + (Math.random() - 0.5) * 60,
-        -ny * sgn * 140 + (Math.random() - 0.5) * 60,
+        -nx * toWall * 140 + (Math.random() - 0.5) * 60,
+        -ny * toWall * 140 + (Math.random() - 0.5) * 60,
         Math.random() * 30,
         0.4,
         8
@@ -875,7 +875,7 @@
     showMsg("CRASH");
   }
 
-  // Blinky reset: return to the most recent safe spot on the track.
+  // Blinky reset: return to the most recent safe spot on the road.
   function respawn() {
     let pick = null;
     for (let i = safe.length - 1; i >= 0; i--) {
@@ -899,7 +899,6 @@
     car.crashTimer = 0;
     trackIdx = idx;
     lastS = TRACK.cum[idx];
-    updateTrackIdx();
   }
 
   function finishLap() {
@@ -1093,16 +1092,15 @@
     car.y += car.vy * dt;
 
     updateTrackIdx();
-    if (nearestDist > OFF_MAP) {
-      crash();
-      updatePlumes(dt);
-      return;
-    }
 
-    // Walls. Jump over them when high enough. Low contact is a crash,
-    // unless BRACE is held and there is pressure left to bounce off.
+    // Walls: only the band itself (the wall plus the car's half width on each
+    // side) can crash the car, and only while it is low enough to hit it.
+    // Once the car is clear of the band, including outside the track, it is
+    // free to drive. Jumping high enough over a wall is safe.
     const lat = lateralOffset();
-    if (Math.abs(lat) > TRACK_HALF - R_CAR && car.z < BARRIER_H - 3) {
+    const absLat = Math.abs(lat);
+    const inBand = absLat > TRACK_HALF - R_CAR && absLat < TRACK_HALF + WALL_T + R_CAR;
+    if (inBand && car.z < BARRIER_H - 3) {
       if (held.brace && car.pressure > 0) {
         braceBounce(lat);
       } else {
@@ -1200,7 +1198,7 @@
     DPR = Math.min(window.devicePixelRatio || 1, 2);
     canvas.width = Math.floor(W * DPR);
     canvas.height = Math.floor(H * DPR);
-    S = Math.min(W, H) / 340;
+    S = Math.min(W, H) / 400;
   }
   window.addEventListener("resize", resize);
 
