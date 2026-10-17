@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Inkrunner v1</title>
+<style>
+  :root {
+    --paper: #f1efe9;
+    --ink: #0f1f4a;
+    --ink-blue: #1d3f8f;
+    --btn: #fbfaf6;
+    --btn-on: #cfe9ff;
+    --ice: #7cc4f0;
+  }
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: var(--paper);
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    font-family: "Courier New", Courier, monospace;
+    color: var(--ink-blue);
+  }
+  #game {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+  #title {
+    position: fixed;
+    top: 12px;
+    left: 14px;
+    font-size: 14px;
+    font-weight: bold;
+    letter-spacing: 2px;
+    pointer-events: none;
+  }
+  #gauge {
+    position: fixed;
+    top: 14px;
+    right: 14px;
+    width: 120px;
+    height: 12px;
+    border: 2px solid var(--ink-blue);
+    background: #faf9f5;
+    pointer-events: none;
+  }
+  #gaugeFill {
+    height: 100%;
+    width: 100%;
+    background: var(--ice);
+  }
+  .pad {
+    position: fixed;
+    bottom: 0;
+    box-sizing: border-box;
+    display: grid;
+    gap: 8px;
+    padding: 10px;
+    padding-bottom: max(10px, env(safe-area-inset-bottom));
+  }
+  #padLeft {
+    left: 0;
+    width: 46%;
+    grid-template-columns: 1fr 1fr;
+  }
+  #padRight {
+    right: 0;
+    width: 50%;
+    grid-template-columns: 1fr 1fr 1fr;
+  }
+  .btn {
+    height: 64px;
+    border: 3px solid var(--ink);
+    border-radius: 12px;
+    background: var(--btn);
+    color: var(--ink);
+    font: inherit;
+    font-size: 14px;
+    font-weight: bold;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    touch-action: none;
+  }
+  .btn.on {
+    background: var(--btn-on);
+  }
+  .btn[data-act="gas"] {
+    grid-column: span 2;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="title">INKRUNNER v1</div>
+<div id="gauge"><div id="gaugeFill"></div></div>
+
+<div id="padLeft" class="pad">
+  <button class="btn" data-act="left">STEER LEFT</button>
+  <button class="btn" data-act="right">STEER RIGHT</button>
+</div>
+
+<div id="padRight" class="pad">
+  <button class="btn" data-act="hopL">HOP LEFT</button>
+  <button class="btn" data-act="hopUp">HOP</button>
+  <button class="btn" data-act="hopR">HOP RIGHT</button>
+  <button class="btn" data-act="boost">BOOST</button>
+  <button class="btn" data-act="gas">GAS</button>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+  const gaugeFill = document.getElementById("gaugeFill");
+
+  // Palette: light paper, graphite pencil, deep blue ink, icy cold gas.
+  const PAPER = "#f1efe9";
+  const GRAPHITE = "#8f8c95";
+  const INK = "#0f1f4a";
+  const INK_BLUE = "#1d3f8f";
+  const CAR_LIGHT = "#f7f9fb";
+  const CAR_SHADE = "#c3cfdd";
+  const CABIN_COLOR = "#dff3ff";
+
+  // Tuning. World units and car local units are the same scale.
+  const GRID = 48;
+  const R_INNER = 120;
+  const R_OUTER = 240;
+  const GRAVITY = 700;
+  const HOP_IMPULSE = 300;
+  const SIDE_IMPULSE = 230;
+  const SIDE_LIFT = 200;
+  const HOP_COST = 22;
+  const SIDE_COST = 12;
+  const BOOST_COST = 30;
+  const REFILL = 14;
+  const MAX_SPEED = 420;
+  const POOL_SIZE = 240;
+
+  let W = 0;
+  let H = 0;
+  let DPR = 1;
+  let S = 1;
+
+  const car = {
+    x: 0, y: 0, h: 0,
+    vx: 0, vy: 0,
+    z: 0, vz: 0,
+    pressure: 100,
+    burst: false
+  };
+
+  const held = { left: false, right: false, gas: false, boost: false };
+  const taps = { hopUp: false, hopL: false, hopR: false };
+
+  // Deterministic jitter so the sketch lines are the same every run.
+  let seed = 1337;
+  function seeded() {
+    seed = (seed * 16807) % 2147483647;
+    return seed / 2147483647;
+  }
+
+  function wobbled(points, amount) {
+    const pts = [];
+    for (let i = 0; i < points.length; i++) {
+      const a = points[i];
+      const b = points[(i + 1) % points.length];
+      pts.push([a[0] + (seeded() - 0.5) * amount, a[1] + (seeded() - 0.5) * amount]);
+      pts.push([
+        (a[0] + b[0]) / 2 + (seeded() - 0.5) * amount * 1.2,
+        (a[1] + b[1]) / 2 + (seeded() - 0.5) * amount * 1.2
+      ]);
+    }
+    const path = new Path2D();
+    pts.forEach(function (p, i) {
+      if (i === 0) path.moveTo(p[0], p[1]);
+      else path.lineTo(p[0], p[1]);
+    });
+    path.closePath();
+    return path;
+  }
+
+  function polyPath(points) {
+    const path = new Path2D();
+    points.forEach(function (p, i) {
+      if (i === 0) path.moveTo(p[0], p[1]);
+      else path.lineTo(p[0], p[1]);
+    });
+    path.closePath();
+    return path;
+  }
+
+  // Car geometry in local units. X is forward, Y is the car's right side.
+  const BODY = [[30, 0], [12, 13], [-24, 13], [-24, -13], [12, -13]];
+  const RIGHT_HALF = [[30, 0], [12, 13], [-24, 13], [-24, 0]];
+  const LEFT_HALF = [[30, 0], [-24, 0], [-24, -13], [12, -13]];
+  const CABIN_POINTS = [[10, -6], [-5, -8], [-5, 8], [10, 6]];
+  const WHEELS = [[16, 14], [16, -14], [-16, 14], [-16, -14]];
+  const NOZZLES = [[-25, 0], [-24, -9], [-24, 9], [-2, -13], [-2, 13]];
+
+  const OUTLINE = wobbled(BODY, 1.0);
+  const OUTLINE_SKETCH = wobbled(BODY, 1.6);
+  const LEFT_PATH = polyPath(LEFT_HALF);
+  const RIGHT_PATH = polyPath(RIGHT_HALF);
+  const CABIN_PATH = polyPath(CABIN_POINTS);
+
+  // Pencil hatch and graphite hatch, each built once.
+  function makeHatch(tilePx, lineWidth, color, scale) {
+    const tile = document.createElement("canvas");
+    tile.width = tilePx;
+    tile.height = tilePx;
+    const g = tile.getContext("2d");
+    const h = tilePx / 2;
+    g.strokeStyle = color;
+    g.lineWidth = lineWidth;
+    g.beginPath();
+    g.moveTo(0, h);
+    g.lineTo(h, 0);
+    g.moveTo(h, tilePx);
+    g.lineTo(tilePx, h);
+    g.stroke();
+    const pattern = ctx.createPattern(tile, "repeat");
+    if (pattern && pattern.setTransform && window.DOMMatrix) {
+      pattern.setTransform(new DOMMatrix().scale(scale));
+    }
+    return pattern;
+  }
+
+  const HATCH_CAR = makeHatch(16, 1.4, INK, 9 / 16);
+  const HATCH_BG = makeHatch(12, 1, GRAPHITE, 1);
+
+  // One soft cold gas puff, drawn once and stamped for every particle.
+  const puff = document.createElement("canvas");
+  puff.width = 64;
+  puff.height = 64;
+  (function buildPuff() {
+    const g = puff.getContext("2d");
+    const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grad.addColorStop(0, "rgba(255, 255, 255, 0.95)");
+    grad.addColorStop(0.5, "rgba(226, 246, 255, 0.7)");
+    grad.addColorStop(0.8, "rgba(124, 196, 240, 0.35)");
+    grad.addColorStop(1, "rgba(124, 196, 240, 0)");
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 64, 64);
+  })();
+
+  // Fixed particle pool, reused forever so nothing is allocated mid-play.
+  const pool = [];
+  for (let i = 0; i < POOL_SIZE; i++) {
+    pool.push({ live: false, x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, life: 0, max: 1, size: 6 });
+  }
+  let poolCursor = 0;
+
+  function emit(x, y, z, vx, vy, vz, life, size) {
+    const p = pool[poolCursor];
+    poolCursor = (poolCursor + 1) % POOL_SIZE;
+    p.live = true;
+    p.x = x;
+    p.y = y;
+    p.z = z;
+    p.vx = vx;
+    p.vy = vy;
+    p.vz = vz;
+    p.life = life;
+    p.max = life;
+    p.size = size;
+  }
+
+  function updatePlumes(dt) {
+    for (let i = 0; i < POOL_SIZE; i++) {
+      const p = pool[i];
+      if (!p.live) continue;
+      p.life -= dt;
+      if (p.life <= 0) {
+        p.live = false;
+        continue;
+      }
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.z += p.vz * dt;
+      p.vx *= Math.max(0, 1 - 2 * dt);
+      p.vy *= Math.max(0, 1 - 2 * dt);
+    }
+  }
+
+  function toScreen(wx, wy, wz) {
+    return [
+      W / 2 + (wx - car.x) * S,
+      H / 2 + (wy - car.y) * S - wz * S * 0.9
+    ];
+  }
+
+  function drawGridLines() {
+    ctx.beginPath();
+    const x0 = Math.ceil((car.x - R_OUTER) / GRID);
+    const x1 = Math.floor((car.x + R_OUTER) / GRID);
+    for (let i = x0; i <= x1; i++) {
+      const sx = W / 2 + (i * GRID - car.x) * S;
+      ctx.moveTo(sx, 0);
+      ctx.lineTo(sx, H);
+    }
+    const y0 = Math.ceil((car.y - R_OUTER) / GRID);
+    const y1 = Math.floor((car.y + R_OUTER) / GRID);
+    for (let j = y0; j <= y1; j++) {
+      const sy = H / 2 + (j * GRID - car.y) * S;
+      ctx.moveTo(0, sy);
+      ctx.lineTo(W, sy);
+    }
+    ctx.strokeStyle = GRAPHITE;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  function drawBackground() {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = PAPER;
+    ctx.fillRect(0, 0, W, H);
+
+    const cx = W / 2;
+    const cy = H / 2;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, R_OUTER * S, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.fillStyle = HATCH_BG;
+    ctx.globalAlpha = 0.3;
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 0.22;
+    drawGridLines();
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, R_INNER * S, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.globalAlpha = 0.45;
+    drawGridLines();
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawShadow() {
+    const shrink = Math.max(0.45, 1 - car.z / 260);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    ctx.globalAlpha = 0.25 * shrink;
+    ctx.fillStyle = "#4a4d57";
+    ctx.beginPath();
+    ctx.ellipse(W / 2, H / 2, 30 * S * shrink, 15 * S * shrink, car.h, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawCar(sx, sy, k) {
+    const cs = Math.cos(car.h);
+    const sn = Math.sin(car.h);
+    ctx.setTransform(DPR * k * cs, DPR * k * sn, -DPR * k * sn, DPR * k * cs, DPR * sx, DPR * sy);
+
+    ctx.fillStyle = INK;
+    for (let i = 0; i < WHEELS.length; i++) {
+      ctx.beginPath();
+      ctx.ellipse(WHEELS[i][0], WHEELS[i][1], 6, 3.2, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.fillStyle = CAR_LIGHT;
+    ctx.fill(LEFT_PATH);
+
+    ctx.fillStyle = CAR_SHADE;
+    ctx.fill(RIGHT_PATH);
+    ctx.fillStyle = HATCH_CAR;
+    ctx.fill(RIGHT_PATH);
+
+    ctx.fillStyle = CABIN_COLOR;
+    ctx.fill(CABIN_PATH);
+    ctx.strokeStyle = INK;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.lineWidth = 0.9;
+    ctx.stroke(CABIN_PATH);
+
+    ctx.lineWidth = 2.6;
+    ctx.stroke(OUTLINE);
+    ctx.lineWidth = 1.2;
+    ctx.globalAlpha = 0.55;
+    ctx.stroke(OUTLINE_SKETCH);
+    ctx.globalAlpha = 1;
+
+    ctx.fillStyle = INK_BLUE;
+    for (let i = 0; i < NOZZLES.length; i++) {
+      ctx.beginPath();
+      ctx.arc(NOZZLES[i][0], NOZZLES[i][1], 1.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawPlumes() {
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    for (let i = 0; i < POOL_SIZE; i++) {
+      const p = pool[i];
+      if (!p.live) continue;
+      const t = p.life / p.max;
+      const grow = 1 + (1 - t) * 1.6;
+      const size = p.size * grow * S * (1 + Math.max(0, p.z) * 0.002);
+      const pos = toScreen(p.x, p.y, p.z);
+      ctx.globalAlpha = Math.min(1, t * 1.2) * 0.9;
+      ctx.drawImage(puff, pos[0] - size / 2, pos[1] - size / 2, size, size);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function render() {
+    drawBackground();
+    drawShadow();
+    const pos = toScreen(car.x, car.y, car.z);
+    const k = S * (1 + car.z * 0.0025);
+    drawCar(pos[0], pos[1], k);
+    drawPlumes();
+  }
+
+  function sideBurst(s, grounded) {
+    const lx = -Math.sin(car.h);
+    const ly = Math.cos(car.h);
+    car.vx += lx * s * SIDE_IMPULSE;
+    car.vy += ly * s * SIDE_IMPULSE;
+    if (grounded) car.vz = SIDE_LIFT;
+    car.pressure -= SIDE_COST;
+    car.burst = true;
+
+    const ex = -s * lx;
+    const ey = -s * ly;
+    for (let i = 0; i < 6; i++) {
+      emit(
+        car.x + ex * 8,
+        car.y + ey * 8,
+        car.z + 3,
+        ex * 170 + (Math.random() - 0.5) * 40,
+        ey * 170 + (Math.random() - 0.5) * 40,
+        Math.random() * 20,
+        0.45,
+        8
+      );
+    }
+  }
+
+  function update(dt) {
+    const grounded = car.z <= 0 && car.vz <= 0;
+    car.burst = false;
+
+    // Steering. Turning is slower in the air.
+    const steer = (held.right ? 1 : 0) - (held.left ? 1 : 0);
+    const speed = Math.hypot(car.vx, car.vy);
+    const turnRate = grounded ? 2.4 : 1.1;
+    car.h += steer * turnRate * dt * Math.min(1, speed / 90);
+
+    const fx = Math.cos(car.h);
+    const fy = Math.sin(car.h);
+    const lx = -fy;
+    const ly = fx;
+    let f = car.vx * fx + car.vy * fy;
+    let l = car.vx * lx + car.vy * ly;
+
+    // Sideways grip is strong on the ground and weak in the air.
+    l *= Math.max(0, 1 - (grounded ? 6 : 0.4) * dt);
+
+    if (grounded) {
+      if (held.gas) f += 260 * dt;
+      f *= Math.max(0, 1 - 0.5 * dt);
+    }
+
+    // Boost is a rear cold gas burst. It works in the air too.
+    if (held.boost && car.pressure > 0) {
+      f += 480 * dt;
+      car.pressure = Math.max(0, car.pressure - BOOST_COST * dt);
+      car.burst = true;
+      if (Math.random() < 0.8) {
+        emit(
+          car.x - fx * 26,
+          car.y - fy * 26,
+          car.z + 2,
+          -fx * 150 + (Math.random() - 0.5) * 30,
+          -fy * 150 + (Math.random() - 0.5) * 30,
+          10,
+          0.5,
+          9
+        );
+      }
+    }
+
+    f = Math.min(f, MAX_SPEED);
+    car.vx = fx * f + lx * l;
+    car.vy = fy * f + ly * l;
+
+    // One-shot bursts from taps.
+    if (taps.hopUp) {
+      taps.hopUp = false;
+      if (grounded && car.pressure >= HOP_COST) {
+        car.vz = HOP_IMPULSE;
+        car.pressure -= HOP_COST;
+        car.burst = true;
+        for (let i = 0; i < 8; i++) {
+          emit(
+            car.x + (Math.random() - 0.5) * 30,
+            car.y + (Math.random() - 0.5) * 30,
+            2,
+            (Math.random() - 0.5) * 60,
+            (Math.random() - 0.5) * 60,
+            30 + Math.random() * 40,
+            0.7,
+            8
+          );
+        }
+      }
+    }
+    if (taps.hopL) {
+      taps.hopL = false;
+      if (car.pressure >= SIDE_COST) sideBurst(-1, grounded);
+    }
+    if (taps.hopR) {
+      taps.hopR = false;
+      if (car.pressure >= SIDE_COST) sideBurst(1, grounded);
+    }
+
+    // Gravity and landing.
+    if (car.z > 0 || car.vz !== 0) {
+      car.vz -= GRAVITY * dt;
+      car.z += car.vz * dt;
+      if (car.z <= 0) {
+        car.z = 0;
+        car.vz = 0;
+      }
+    }
+
+    car.x += car.vx * dt;
+    car.y += car.vy * dt;
+
+    if (!car.burst) {
+      car.pressure = Math.min(100, car.pressure + REFILL * dt);
+    }
+
+    updatePlumes(dt);
+  }
+
+  let lastPct = -1;
+  function updateGauge() {
+    const pct = Math.round(car.pressure);
+    if (pct !== lastPct) {
+      lastPct = pct;
+      gaugeFill.style.width = pct + "%";
+      gaugeFill.style.background = pct < 20 ? "#ff9e84" : "#7cc4f0";
+    }
+  }
+
+  // Input: on-screen buttons.
+  document.querySelectorAll(".btn").forEach(function (el) {
+    const act = el.dataset.act;
+    const release = function () {
+      el.classList.remove("on");
+      if (act in held) held[act] = false;
+    };
+    el.addEventListener("pointerdown", function (e) {
+      e.preventDefault();
+      el.setPointerCapture(e.pointerId);
+      el.classList.add("on");
+      if (act in held) held[act] = true;
+      else taps[act] = true;
+    });
+    el.addEventListener("pointerup", release);
+    el.addEventListener("pointercancel", release);
+    el.addEventListener("lostpointercapture", release);
+  });
+
+  // Input: keyboard for desktop testing.
+  const KEYMAP = {
+    ArrowLeft: "left", KeyA: "left",
+    ArrowRight: "right", KeyD: "right",
+    ArrowUp: "gas", KeyW: "gas",
+    ShiftLeft: "boost", ShiftRight: "boost",
+    KeyQ: "hopL", KeyE: "hopR", Space: "hopUp"
+  };
+  window.addEventListener("keydown", function (e) {
+    const act = KEYMAP[e.code];
+    if (!act) return;
+    e.preventDefault();
+    if (act in held) held[act] = true;
+    else if (!e.repeat) taps[act] = true;
+  });
+  window.addEventListener("keyup", function (e) {
+    const act = KEYMAP[e.code];
+    if (act && act in held) held[act] = false;
+  });
+  window.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+
+  function resize() {
+    W = window.innerWidth;
+    H = window.innerHeight;
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    S = Math.min(W, H) / 300;
+  }
+  window.addEventListener("resize", resize);
+
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    updateGauge();
+    requestAnimationFrame(frame);
+  }
+
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
